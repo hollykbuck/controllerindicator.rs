@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [master]
   pull_request:
   workflow_dispatch:
 
@@ -42,13 +42,14 @@ jobs:
 
   msrv:
     # The floor declared in Cargo.toml. `cargo check` is enough here: the point is
-    # to catch a newer std API creeping in, not to test the compiler.
-    name: MSRV (1.85)
+    # to catch a newer std API creeping in, not to test the compiler. Keep the
+    # version here in step with `rust-version` in Cargo.toml.
+    name: MSRV (1.88)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: dtolnay/rust-toolchain@1.88.0
 
       - uses: Swatinem/rust-cache@v2
 

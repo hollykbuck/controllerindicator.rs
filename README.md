@@ -17,8 +17,9 @@ cargo run --release -- -w
 
 ## Build
 
-Requires Windows and Rust 1.85 or newer (the floor is edition 2024, not the
-`windows` crate's own 1.82).
+Requires Windows and Rust 1.88 or newer. Edition 2024 alone would allow 1.85, but
+the code uses let-chains and `slice::as_chunks`, which both landed in 1.88. CI checks
+that floor so it cannot drift upward unnoticed.
 
 ```
 cargo build --release
