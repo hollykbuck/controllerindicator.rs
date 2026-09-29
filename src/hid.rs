@@ -5,7 +5,7 @@
 //! Win32 HID enumeration and IO.
 //!
 //! Three things here cost real time to work out, and all three are why this module
-//! looks the way it does. See `xboxindicator/knowledge/notes.md` for the originals.
+//! looks the way it does. See `knowledge/notes.md` for the originals.
 //!
 //! **Feature reports do not go through `DeviceIoControl`.** The documented route is
 //! an `IOCTL_HID_GET_FEATURE` control code, and on current Windows the HID stack
@@ -87,6 +87,24 @@ impl Drop for DeviceInfoSet {
     }
 }
 
+/// True when a SetupAPI HID path names the given vendor and product.
+///
+/// The path embeds `vid_XXXX&pid_YYYY`, so a device can be ruled out without being
+/// opened. Checking that first is worth a lot: `describe` opens a device to read its
+/// attributes, and a machine has HID collections on its keyboard, mouse, webcam and
+/// virtual input drivers that a rescan would otherwise churn through every couple of
+/// seconds just to filter them out.
+pub fn path_matches(path: &str, vendor_id: u16, product_ids: &[u16]) -> bool {
+    let path = path.to_ascii_lowercase();
+    let vendor = format!("vid_{vendor_id:04x}");
+    if !path.contains(&vendor) {
+        return false;
+    }
+    product_ids
+        .iter()
+        .any(|&product| path.contains(&format!("pid_{product:04x}")))
+}
+
 /// List present HID collections, optionally filtered by vendor and product id.
 pub fn enumerate_hid_devices(
     vendor_id: Option<u16>,
@@ -134,6 +152,14 @@ pub fn enumerate_hid_devices(
         let Some(path) = device_path(set.0, &interface) else {
             continue;
         };
+        // Rule devices out on the path before paying to open one, but only when
+        // there is a filter to apply — an unfiltered walk still lists everything,
+        // including virtual collections whose paths carry no vid or pid at all.
+        if let (Some(vendor), Some(products)) = (vendor_id, product_ids)
+            && !path_matches(&path, vendor, products)
+        {
+            continue;
+        }
         let Some(info) = describe(&path) else {
             continue;
         };
@@ -142,8 +168,8 @@ pub fn enumerate_hid_devices(
         {
             continue;
         }
-        if let Some(wanted) = product_ids
-            && !wanted.contains(&info.product_id)
+        if let Some(products) = product_ids
+            && !products.contains(&info.product_id)
         {
             continue;
         }
@@ -588,6 +614,51 @@ mod tests {
         let upper = lower.to_ascii_uppercase();
         assert!(is_bluetooth_path(lower));
         assert!(is_bluetooth_path(&upper));
+    }
+
+    #[test]
+    fn a_sony_path_is_recognised_without_opening_it() {
+        let path = r"\\?\hid#vid_054c&pid_05c4&mi_00#7&1234abcd&0&0000#{4d1e55b2-f16f-11cf-88cb-001111000030}";
+        assert!(path_matches(path, 0x054C, &[0x05C4, 0x09CC, 0x0BA0]));
+    }
+
+    #[test]
+    fn the_path_filter_ignores_case() {
+        let upper = r"\\?\HID#VID_054C&PID_05C4#ABC";
+        let lower = upper.to_ascii_lowercase();
+        assert!(path_matches(upper, 0x054C, &[0x05C4]));
+        assert!(path_matches(&lower, 0x054C, &[0x05C4]));
+    }
+
+    #[test]
+    fn the_path_filter_rejects_the_wrong_vendor_or_product() {
+        let path = r"\\?\hid#vid_258a&pid_0013&mi_01&col02#8&398fcc90&0&0001#{}";
+        assert!(!path_matches(path, 0x054C, &[0x05C4]));
+        assert!(!path_matches(path, 0x258A, &[0x05C4]));
+        assert!(!path_matches(path, 0x258A, &[0x09CC]));
+        assert!(path_matches(path, 0x258A, &[0x0013]));
+    }
+
+    #[test]
+    fn the_path_filter_rejects_a_virtual_collection_with_no_ids() {
+        // These are what a rescan used to open just to throw away.
+        let path = r"\\?\hid#hid_device_system_vhf&col04#2&cb88041&0&0003#{4d1e55b2-f16f-11cf-88cb-001111000030}";
+        assert!(!path_matches(path, 0x054C, &[0x05C4]));
+    }
+
+    #[test]
+    fn the_filter_and_the_opened_attributes_agree() {
+        // The path pre-filter is only an optimisation: whatever survives it must
+        // still pass the check against what the device actually reports.
+        let found = enumerate_hid_devices(Some(0x054C), Some(&[0x05C4, 0x09CC, 0x0BA0])).unwrap();
+        for info in found {
+            assert_eq!(info.vendor_id, 0x054C, "{}", info.path);
+            assert!(
+                [0x05C4, 0x09CC, 0x0BA0].contains(&info.product_id),
+                "{}",
+                info.path
+            );
+        }
     }
 
     #[test]
