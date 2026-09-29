@@ -1,5 +1,7 @@
 # controllerindicator
 
+[![CI](https://github.com/hollykbuck/controllerindicator.rs/actions/workflows/ci.yml/badge.svg)](https://github.com/hollykbuck/controllerindicator.rs/actions/workflows/ci.yml)
+
 Watch what a game controller is doing, on Windows. Prints button presses, stick and
 trigger movement, and a live event stream; or draws it all in a small always-handy
 window.
