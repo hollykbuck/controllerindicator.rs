@@ -2,8 +2,10 @@
 name = "controllerindicator"
 version = "0.1.0"
 edition = "2024"
-# Edition 2024 is the floor, not the `windows` crate's own 1.82.
-rust-version = "1.85"
+# Edition 2024 alone would say 1.85, but the code uses let-chains and
+# `slice::as_chunks`, both of which landed in 1.88. Verified with `cargo +1.88.0
+# check --all-targets`.
+rust-version = "1.88"
 
 [dependencies]
 anyhow = "1"
