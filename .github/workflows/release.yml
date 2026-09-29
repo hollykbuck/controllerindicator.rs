@@ -17,7 +17,14 @@ jobs:
     name: Build and publish
     runs-on: windows-latest
     steps:
+      # A manual run is triggered from whatever branch is default, so without an
+      # explicit ref it would build that branch's code and then label the release
+      # with the tag — shipping the wrong commit under the right name whenever the
+      # two happen to share a version.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -34,6 +41,12 @@ jobs:
           # lies about which version it holds, so refuse rather than paper over it.
           if [ "$TAG" != "v$VERSION" ]; then
             echo "::error::tag $TAG does not match the Cargo.toml version v$VERSION"
+            exit 1
+          fi
+          # And the tag has to exist at all, which is a separate failure from a
+          # mismatched one: a typo in the workflow_dispatch input.
+          if ! git rev-parse -q --verify "refs/tags/$TAG" > /dev/null; then
+            echo "::error::tag $TAG does not exist in this repository"
             exit 1
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
