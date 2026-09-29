@@ -16,6 +16,7 @@
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -686,22 +687,62 @@ impl Slot {
 
 /// Reads every attached DualShock over HID and reports XInput-shaped state.
 ///
-/// One background thread rescans on a timer and drains each pad with non-blocking
-/// reads, so hotplug, Bluetooth sleep and calls that would otherwise block never
-/// stall the caller.
+/// # Who owns what
+///
+/// The reader thread is the *only* thing that ever touches a device handle. It owns
+/// the [`Slot`] list outright, reads the pads, applies rumble and closes handles on
+/// its way out. The main thread never sees a `Slot`, only an immutable [`SlotView`]
+/// that the reader swaps in wholesale.
+///
+/// That split is what removes the locking hazards rather than papering over them:
+/// there is no second writer of a handle, so `close` can never race a `write`, and
+/// the one lock the main thread takes is never held across a HID call — which
+/// matters because [`HidDevice::get_feature_report`] blocks.
+///
+/// Rumble is the one thing that has to cross back, and it goes via a request queue
+/// the reader drains, so the main thread returns immediately instead of waiting on
+/// a device it does not own. The extra latency is at most one poll interval.
 pub struct PS4 {
-    inner: Arc<Mutex<Inner>>,
-    stop: Arc<AtomicBool>,
+    shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
 }
 
-struct Inner {
-    slots: Vec<Slot>,
-    scan_interval: Duration,
-    poll_interval: Duration,
-    /// When the next device enumeration is due. Enumeration opens every HID device
-    /// on the machine, so it cannot run at the poll rate.
-    next_scan: Option<Instant>,
+/// The little that both threads touch. Neither field is held across a HID call.
+struct Shared {
+    /// The reader's latest view of every pad, replaced wholesale each pass.
+    published: Mutex<Vec<SlotView>>,
+    /// Rumble the main thread has asked for, drained by the reader next pass.
+    rumble: Mutex<Vec<Rumble>>,
+    stop: AtomicBool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Rumble {
+    index: u8,
+    left: f32,
+    right: f32,
+}
+
+/// An immutable snapshot of one pad, published by the reader thread.
+#[derive(Debug, Clone)]
+struct SlotView {
+    state: Option<RawState>,
+    motion: Option<Motion>,
+    calibration: Calibration,
+    name: String,
+    alive: bool,
+}
+
+impl SlotView {
+    fn of(slot: &Slot) -> Self {
+        Self {
+            state: slot.state,
+            motion: slot.motion,
+            calibration: slot.calibration,
+            name: slot.name(),
+            alive: slot.alive(),
+        }
+    }
 }
 
 impl PS4 {
@@ -715,95 +756,101 @@ impl PS4 {
 
     /// [`PS4::new`] with explicit rescan and poll rates.
     ///
+    /// The first scan runs on the reader thread rather than here, so that a device
+    /// handle is only ever opened by its owner. This waits for that scan to report
+    /// back before returning, which is what lets a failure be reported as an error.
+    ///
     /// # Errors
     /// As [`PS4::new`].
     pub fn with_intervals(scan_interval: Duration, poll_interval: Duration) -> Result<Self> {
-        let inner = Arc::new(Mutex::new(Inner {
-            slots: Vec::new(),
-            scan_interval,
-            poll_interval,
-            next_scan: None,
-        }));
-        rescan(&inner, true).map_err(|err| anyhow::anyhow!("Win32 HID is unavailable: {err}"))?;
+        let shared = Arc::new(Shared {
+            published: Mutex::new(Vec::new()),
+            rumble: Mutex::new(Vec::new()),
+            stop: AtomicBool::new(false),
+        });
 
-        let stop = Arc::new(AtomicBool::new(false));
-        let worker = Arc::clone(&inner);
-        let worker_stop = Arc::clone(&stop);
+        let (report, ready) = mpsc::channel();
+        let worker = Arc::clone(&shared);
         let thread = std::thread::Builder::new()
             .name("controllerindicator-ps4".into())
-            .spawn(move || {
-                let poll_interval = worker
-                    .lock()
-                    .map(|inner| inner.poll_interval)
-                    .unwrap_or(Duration::from_millis(2));
-                while !worker_stop.load(Ordering::Relaxed) {
-                    if let Err(err) = rescan(&worker, false) {
-                        eprintln!("DualShock rescan failed: {err}");
-                    }
-                    drain(&worker);
-                    std::thread::sleep(poll_interval);
-                }
-            })
+            .spawn(move || reader_loop(worker, scan_interval, poll_interval, report))
             .context("could not start the DualShock reader thread")?;
 
+        // The first scan has to have happened for the slot list to mean anything.
+        // The timeout only matters on a machine where a device hangs the HID stack.
+        match ready.recv_timeout(Duration::from_secs(2)) {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                let _ = thread.join();
+                return Err(err).context("Win32 HID is unavailable");
+            }
+            Err(_) => {
+                return Ok(Self {
+                    shared,
+                    thread: Some(thread),
+                });
+            }
+        }
         Ok(Self {
-            inner,
-            stop,
+            shared,
             thread: Some(thread),
         })
+    }
+
+    fn views(&self) -> std::sync::MutexGuard<'_, Vec<SlotView>> {
+        self.shared
+            .published
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
     }
 }
 
 impl Drop for PS4 {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        self.shared.stop.store(true, Ordering::Relaxed);
         if let Some(thread) = self.thread.take() {
+            // Unbounded, unlike the Python original's 2 second timeout: the reader
+            // closes its own handles on the way out, so returning early would drop
+            // slots underneath a thread still using them.
             let _ = thread.join();
-        }
-        let mut inner = self.inner.lock().unwrap_or_else(|err| err.into_inner());
-        for slot in &mut inner.slots {
-            slot.close();
         }
     }
 }
 
 impl GamepadBackend for PS4 {
     fn max_index(&self) -> u8 {
-        let inner = self.inner.lock().unwrap_or_else(|err| err.into_inner());
-        inner.slots.len().saturating_sub(1) as u8
+        self.views().len().saturating_sub(1) as u8
     }
 
     fn get_state(&self, index: u8) -> Result<Option<RawState>> {
-        let inner = self.inner.lock().unwrap_or_else(|err| err.into_inner());
-        Ok(inner
-            .slots
+        Ok(self
+            .views()
             .get(index as usize)
-            .filter(|slot| slot.alive())
-            .and_then(|slot| slot.state))
+            .filter(|view| view.alive)
+            .and_then(|view| view.state))
     }
 
     fn set_vibration(&self, index: u8, left: f32, right: f32) -> Result<bool> {
-        let mut inner = self.inner.lock().unwrap_or_else(|err| err.into_inner());
-        let Some(slot) = inner.slots.get_mut(index as usize) else {
+        // The answer is whether the pad is there, not whether the motors took it;
+        // the reader applies the request on its next pass. `max_index` is the
+        // highest valid index, not the count.
+        if index > self.max_index() {
             return Ok(false);
-        };
-        let bluetooth = slot.bluetooth();
-        let color = PLAYER_COLORS[index as usize % PLAYER_COLORS.len()];
-        let payload = effects_payload(motor(left), motor(right), color);
-        Ok(slot.send(&build_effects(
-            bluetooth,
-            EFFECT_RUMBLE | EFFECT_LED,
-            &payload,
-        )))
+        }
+        self.shared
+            .rumble
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .push(Rumble { index, left, right });
+        Ok(true)
     }
 
     fn connected_indices(&self) -> Result<Vec<u8>> {
-        let inner = self.inner.lock().unwrap_or_else(|err| err.into_inner());
-        Ok(inner
-            .slots
+        Ok(self
+            .views()
             .iter()
             .enumerate()
-            .filter(|(_, slot)| slot.alive())
+            .filter(|(_, view)| view.alive)
             .map(|(index, _)| index as u8)
             .collect())
     }
@@ -813,58 +860,109 @@ impl GamepadBackend for PS4 {
     }
 
     fn motion(&self, index: u8) -> Option<Motion> {
-        let inner = self.inner.lock().unwrap_or_else(|err| err.into_inner());
-        let slot = inner.slots.get(index as usize)?;
-        if !slot.alive() {
+        let views = self.views();
+        let view = views.get(index as usize)?;
+        if !view.alive {
             return None;
         }
-        slot.motion
+        view.motion
     }
 
     fn calibration(&self, index: u8) -> Option<Calibration> {
-        let inner = self.inner.lock().unwrap_or_else(|err| err.into_inner());
-        Some(inner.slots.get(index as usize)?.calibration)
+        Some(self.views().get(index as usize)?.calibration)
     }
 
     fn name(&self, index: u8) -> Option<String> {
-        let inner = self.inner.lock().unwrap_or_else(|err| err.into_inner());
-        Some(inner.slots.get(index as usize)?.name())
+        Some(self.views().get(index as usize)?.name.clone())
+    }
+}
+
+/// The reader thread: the sole owner of every device handle.
+///
+/// Takes the slot list as a local, so nothing needs locking to use it.
+fn reader_loop(
+    shared: Arc<Shared>,
+    scan_interval: Duration,
+    poll_interval: Duration,
+    ready: mpsc::Sender<Result<()>>,
+) {
+    let mut slots: Vec<Slot> = Vec::new();
+    let mut next_scan = None;
+    let mut reported = false;
+
+    while !shared.stop.load(Ordering::Relaxed) {
+        let now = Instant::now();
+        if next_scan.is_none_or(|next| now >= next) {
+            next_scan = Some(now + scan_interval);
+            let result = rescan(&mut slots);
+            if !reported {
+                let _ = ready.send(result);
+                reported = true;
+            } else if let Err(err) = &result {
+                eprintln!("DualShock rescan failed: {err}");
+            }
+        }
+
+        // Apply whatever the main thread asked for while we were away.
+        let requests = {
+            let mut queued = shared.rumble.lock().unwrap_or_else(|err| err.into_inner());
+            std::mem::take(&mut *queued)
+        };
+        for request in requests {
+            let Some(slot) = slots.get_mut(request.index as usize) else {
+                continue;
+            };
+            let color = PLAYER_COLORS[request.index as usize % PLAYER_COLORS.len()];
+            let payload = effects_payload(motor(request.left), motor(request.right), color);
+            let packet = build_effects(slot.bluetooth(), EFFECT_RUMBLE | EFFECT_LED, &payload);
+            slot.send(&packet);
+        }
+
+        // Read every pad once, then swap the whole view in.
+        for slot in &mut slots {
+            slot.receive();
+            if slot.broken {
+                // Drop the handle so the next rescan can pick the pad back up.
+                slot.close();
+            } else if slot.bluetooth()
+                && slot.device.is_some()
+                && slot
+                    .last_packet
+                    .is_none_or(|last| last.elapsed().as_secs_f64() > BLUETOOTH_QUIET_SECONDS)
+            {
+                slot.tickle();
+            }
+        }
+        let views: Vec<SlotView> = slots.iter().map(SlotView::of).collect();
+        *shared
+            .published
+            .lock()
+            .unwrap_or_else(|err| err.into_inner()) = views;
+
+        std::thread::sleep(poll_interval);
+    }
+
+    for slot in &mut slots {
+        slot.close();
     }
 }
 
 /// Bring the slot list in line with what is plugged in right now, and open anything
-/// new. Runs on the reader thread, on a timer.
-///
-/// `force` skips the timer, which is what the constructor needs so the first slot
-/// list is real rather than empty.
-fn rescan(inner: &Arc<Mutex<Inner>>, force: bool) -> Result<()> {
-    {
-        let mut guard = inner.lock().unwrap_or_else(|err| err.into_inner());
-        if !force {
-            let now = Instant::now();
-            if guard.next_scan.is_some_and(|next| now < next) {
-                return Ok(());
-            }
-            guard.next_scan = Some(now + guard.scan_interval);
-        }
-    }
-
+/// new. Called only from the reader thread, so it needs no lock of its own.
+fn rescan(slots: &mut Vec<Slot>) -> Result<()> {
     let found = enumerate_hid_devices(Some(SONY_VENDOR_ID), Some(&DS4_PRODUCT_IDS))?;
 
-    let mut guard = inner.lock().unwrap_or_else(|err| err.into_inner());
-    // Dropping a slot closes its handle through `Slot::drop`'s `HidDevice`.
-    guard
-        .slots
-        .retain(|slot| found.iter().any(|info| info.path == slot.info.path));
+    // Dropping a slot closes its handle through `HidDevice`'s own Drop.
+    slots.retain(|slot| found.iter().any(|info| info.path == slot.info.path));
     for info in found {
-        if !guard.slots.iter().any(|slot| slot.info.path == info.path) {
-            guard.slots.push(Slot::new(info));
+        if !slots.iter().any(|slot| slot.info.path == info.path) {
+            slots.push(Slot::new(info));
         }
     }
 
-    // Opening stays under the lock: `HidDevice::new` blocks on the calibration
-    // report, and letting the lock go would show a caller a slot with no state.
-    for slot in &mut guard.slots {
+    // Opening is the slow part: it blocks on the calibration feature report. It
+    // happens here, on the owning thread, so nothing else can be stalled by it.
+    for slot in slots.iter_mut() {
         if let Err(err) = slot.open() {
             // A pad we cannot open stays in the list but stays dead, so the next
             // scan can try again once whatever is holding it lets go.
@@ -872,25 +970,6 @@ fn rescan(inner: &Arc<Mutex<Inner>>, force: bool) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// Drain every pad once, tidying up after any that have gone away.
-fn drain(inner: &Arc<Mutex<Inner>>) {
-    let mut guard = inner.lock().unwrap_or_else(|err| err.into_inner());
-    for slot in &mut guard.slots {
-        slot.receive();
-        if slot.broken {
-            // Drop the handle so the next rescan can pick the pad back up.
-            slot.close();
-        } else if slot.bluetooth()
-            && slot.device.is_some()
-            && slot
-                .last_packet
-                .is_none_or(|last| last.elapsed().as_secs_f64() > BLUETOOTH_QUIET_SECONDS)
-        {
-            slot.tickle();
-        }
-    }
 }
 
 /// Build a USB state report for tests: the report id, then the payload.
@@ -1437,5 +1516,76 @@ mod tests {
         assert_eq!(product_name(0x0BA0), "DualShock 4 Edge");
         // An unknown pad still gets a usable name rather than nothing.
         assert_eq!(product_name(0x1234), "DualShock 4");
+    }
+
+    // ---- the backend, against whatever is actually plugged in ----
+
+    /// The reader thread must be able to open HID, publish a slot list and shut down
+    /// again. Which pads are attached is not asserted: the point is that the thread
+    /// owns its devices and the published view reflects them.
+    #[test]
+    fn the_reader_thread_starts_reports_and_stops() {
+        let backend =
+            match PS4::with_intervals(Duration::from_millis(200), Duration::from_millis(2)) {
+                Ok(backend) => backend,
+                // A machine with no HID class at all is a legitimate outcome.
+                Err(_) => return,
+            };
+
+        // Whatever the enumeration found, the view has to be self-consistent:
+        // a connected slot has to have state, and the max index has to fit it.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let connected = backend.connected_indices().expect("slots");
+            for index in &connected {
+                assert!(
+                    backend.get_state(*index).expect("state").is_some(),
+                    "slot {index} is listed as connected but has no state"
+                );
+                assert!(backend.name(*index).is_some());
+                assert!(backend.calibration(*index).is_some());
+            }
+            assert!(backend.max_index() + 1 >= connected.len() as u8);
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        // Rumble on a slot that does not exist is refused rather than queued.
+        assert!(!backend.set_vibration(200, 1.0, 1.0).expect("rumble"));
+        // Every slot the backend claims to have must accept a rumble request, right
+        // up to the highest index. An off-by-one here would make `stop_vibration`
+        // report failure, which is how it first showed up.
+        for index in 0..=backend.max_index() {
+            assert!(
+                backend.set_vibration(index, 0.0, 0.0).expect("rumble"),
+                "slot {index} is in range but refused a rumble request"
+            );
+        }
+        assert!(
+            !backend
+                .set_vibration(backend.max_index() + 1, 0.0, 0.0)
+                .expect("rumble")
+        );
+        // Dropping has to join the reader and close its handles.
+        drop(backend);
+    }
+
+    #[test]
+    fn a_rescan_does_not_disturb_a_slot_that_is_still_there() {
+        let mut slots: Vec<Slot> = Vec::new();
+        rescan(&mut slots).expect("first scan");
+        let first = slots
+            .iter()
+            .map(|s| s.info.path.clone())
+            .collect::<Vec<_>>();
+        // A second scan with nothing unplugged must leave the list alone.
+        rescan(&mut slots).expect("second scan");
+        let second = slots
+            .iter()
+            .map(|s| s.info.path.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(first, second, "a rescan reshuffled or duplicated slots");
     }
 }

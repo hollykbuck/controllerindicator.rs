@@ -5,7 +5,7 @@
 //! Win32 HID enumeration and IO.
 //!
 //! Three things here cost real time to work out, and all three are why this module
-//! looks the way it does. See `knowledge/notes.md` for the originals.
+//! looks the way it does. 
 //!
 //! **Feature reports do not go through `DeviceIoControl`.** The documented route is
 //! an `IOCTL_HID_GET_FEATURE` control code, and on current Windows the HID stack
