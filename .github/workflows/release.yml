@@ -1,0 +1,82 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build a release for
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Resolve the tag
+        id: tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.tag || github.ref_name }}"
+          VERSION="$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[0].version')"
+          # A tag that disagrees with Cargo.toml would produce a release whose name
+          # lies about which version it holds, so refuse rather than paper over it.
+          if [ "$TAG" != "v$VERSION" ]; then
+            echo "::error::tag $TAG does not match the Cargo.toml version v$VERSION"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      # Run the tests here too rather than trusting that CI passed: a tag can be
+      # pushed from a commit that never went through a workflow run.
+      - name: Tests
+        run: cargo test
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package
+        id: package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = '${{ steps.tag.outputs.version }}'
+          $stage = Join-Path $env:RUNNER_TEMP 'package'
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          Copy-Item 'target\release\controllerindicator.exe' $stage
+          Copy-Item 'README.md' $stage
+          if (Test-Path 'LICENSE') { Copy-Item 'LICENSE' $stage }
+
+          $zip = "controllerindicator-v$version-windows-x64"
+          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath "$zip.zip"
+
+          # Published alongside the binary so a download can be checked.
+          $hash = (Get-FileHash "$zip.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $zip.zip" | Out-File "$zip.zip.sha256" -Encoding ascii
+          "asset=$zip.zip" >> $env:GITHUB_OUTPUT
+          "checksum=$zip.zip.sha256" >> $env:GITHUB_OUTPUT
+
+      - name: Publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          gh release create $env:TAG `
+            "${{ steps.package.outputs.asset }}" `
+            "${{ steps.package.outputs.checksum }}" `
+            --title "controllerindicator $env:TAG" `
+            --generate-notes `
+            --verify-tag

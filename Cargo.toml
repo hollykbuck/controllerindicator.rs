@@ -2,6 +2,8 @@
 name = "controllerindicator"
 version = "0.1.0"
 edition = "2024"
+# Edition 2024 is the floor, not the `windows` crate's own 1.82.
+rust-version = "1.85"
 
 [dependencies]
 anyhow = "1"

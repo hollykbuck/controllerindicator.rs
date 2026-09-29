@@ -17,7 +17,8 @@ cargo run --release -- -w
 
 ## Build
 
-Requires Rust 1.82 or newer and Windows.
+Requires Windows and Rust 1.85 or newer (the floor is edition 2024, not the
+`windows` crate's own 1.82).
 
 ```
 cargo build --release
